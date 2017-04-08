@@ -14,16 +14,21 @@
    exit
    pre
    post
-   every)
+   each
+   all)
   #:mutable)
 ;; The entity type.
 ;; Should basically be opaque to users of the library.
 (struct entity (id components system-links))
-(struct world (systems components) #:mutable)
+(struct world (systems components entities) #:mutable)
 
-(define (default-systems) (make-vector 0 #f))
+(define (default-systems)    (make-vector 0 #f))
 (define (default-components) (make-vector 0 #f))
-(define (default-world) (world (default-systems) (default-components)))
+(define (default-entities)   (make-hash))
+(define (default-world)
+  (world (default-systems)
+         (default-components)
+         (default-entities)))
 
 ;; This software is released under the terms of the MIT License.  See
 ;; the LICENSE file in this repository.
@@ -50,9 +55,13 @@
 ;; have entered
 ;; exit is called on entities exiting the system, before they have
 ;; exited.
-;; pre is called before every, during system-execute
-;; post is called after every, during system-execute
-;; every is called on each component of the system during system-execute
+;; all is called with a list of all entities of the system during
+;; system-execute, before any other function
+;; pre is called before each, during system-execute
+;; post is called after each, during system-execute
+;; each is called on each component of the system during system-execute
+;; TODO: Improve implementation of `all` (it's a cache-thrashing mess at the
+;;       moment, but it might not matter).
 
 (define (system!
           cmpnts
@@ -64,7 +73,8 @@
           #:exit  (exit #f)
           #:pre   (pre #f)
           #:post  (post #f)
-          #:every (every #f))
+          #:each  (each #f)
+          #:all   (all #f))
   (define cmp-ids (map (λ (f) (f cmpnts)) local-components))
   (set-world-systems!
     wrld
@@ -77,7 +87,8 @@
                   exit
                   pre
                   post
-                  every)))
+                  each
+                  all)))
   (fx- (vector-length (world-systems wrld)) 1))
 
 
@@ -88,10 +99,10 @@
   (let ((ent (entity-raw! wrld)))
 	(let loop ((cmp in-cmp))
 	  (cond
-	   ((eq? (list) cmp)
-		ent)
+	   ((null? cmp)
+        ent)
 	   (else
-		(apply add-component! wrld ent (car cmp))
+        (apply add-component! wrld ent (car cmp))
 		(loop (cdr cmp)))))))
 
 ;; Add a component c to entity e, with arguments to construct the component args
@@ -99,6 +110,11 @@
 ;; this function adds it to the implied system or systems,
 ;; calling entry functions as needed.
 (define (add-component! wrld e c . args)
+  (define eid (entity-id e))
+  (define cmp-set (hash-ref (world-entities wrld) (entity-id e) #f))
+  (if cmp-set
+    (hash-set! cmp-set c args)
+    (hash-set! (world-entities wrld) eid (make-hash (list (cons c args)))))
   (let ((anti-systems (list-anti-systems wrld e)))
 	(apply add-component-raw! wrld e c args)
 	(for-each
@@ -114,13 +130,17 @@
 ;; also remove the entity from those systems, calling exit functions
 ;; as needed.
 (define (remove-component! wrld e c)
+  (define eid (entity-id e))
+  (define cmp-set (hash-ref (world-entities wrld) (entity-id e) #f))
+  (when cmp-set
+    (hash-remove! cmp-set c))
   (when (not (nullcomp? (vector-ref (entity-components e) c)))
-	  (let ((entity-systems (list-systems e)))
+	  (let ((entity-systems (list-systems wrld e)))
 		(for-each
 		 (lambda (si)
 		   (let* ((system (vector-ref (world-systems wrld) si)))
 			 (if (system-uses-component? system c)
-				 (remove-from-system-raw! e si)
+				 (remove-from-system-raw! wrld e si)
 				 #f)))
 		 entity-systems)
 		(nullify-entity-component! e c))))
@@ -129,10 +149,10 @@
 ;; an entity amounts to nothing more than removing all of its components
 ;; the user must throw away any references so the GC can reclaim the object.
 ;; Alternatively, the entity can return to a pool and be reused
-(define (delete! entity)
+(define (delete! wrld entity)
   (when entity
 	  (for-each (lambda (c)
-				  (remove-component! entity c))
+				  (remove-component! wrld entity c))
 				(get-component-list entity)))
   #f)
 
@@ -248,7 +268,7 @@
 			  (lambda (i o)
 				(if (fx< i n)
 					(loop (fx+ i 1)
-						  (if (entity-in-system? entity i)
+						  (if (entity-in-system? wrld entity i)
 							  (cons i o)
 							  o))
 					o))))
@@ -338,10 +358,17 @@
                   out)))
 	   (else (reverse out))))))
 
+;; TODO: Is this the best way to do this? Maybe we should express both this and
+;;       system-map-entities in terms of system-reduce-entities. Addendum: does
+;;       it matter?
+(define (system-list-entities wrld s)
+  (system-map-entities wrld list s))
+
 ;; Apply f to the entity and appropriate components and collect just the entity if the result is true.
-(define (system-filter-entities f s)
+(define (system-filter-entities wrld f s)
   (let ((output (list)))
 	(system-for-each-entity
+   wrld
 	 (lambda args
 	   (when (apply f rest)
 		   (set! output (cons (car args) output))))
@@ -352,15 +379,15 @@
 ;; initial value init.
 ;; f takes the accumlator, then the entity, then the
 ;; component values of system s
-(define (system-reduce-entities f s init)
+(define (system-reduce-entities wrld f s init)
   (let ((ac init))
-	(system-for-each-entity (lambda rest
+	(system-for-each-entity wrld (lambda rest
 							  (set! ac (apply f ac rest))) s)
 	ac))
 
 ;; Return the count of entities in system s
-(define (system-count-entities s)
-  (system-reduce-entities (lambda (ac . rest)
+(define (system-count-entities wrld s)
+  (system-reduce-entities wrld (lambda (ac . rest)
 							(fx+ ac 1))
 						  s
 						  0))
@@ -368,23 +395,27 @@
 ;; perform the default behavior of system s,
 ;; which is
 ;; 1. execute the `pre` function, if it exists.
-;; 2. execute the `every` function on each entity, if it exists.
+;; 2. execute the `each` function on each entity, if it exists.
 ;; 3. execute the `post` function if it exists.
 (define (system-execute wrld s [ctx #f])
   (let* ((si s)
 		 (s (vector-ref (world-systems wrld) si))
+		 (all (system-all s))
 		 (pre (system-pre s))
 		 (post (system-post s))
-		 (every (system-every s)))
-	(if pre (pre) #f)
-	(if every
+		 (each (system-each s)))
+	(if all (all ctx (system-list-entities wrld si)) #f)
+  ;; TODO: Don't pass ctx if it's false (should move it to be last argument so
+  ;; it's easier for systems to be polymorphic over taking/not taking context)
+	(if pre (pre ctx) #f)
+	(if each
       (system-for-each-entity wrld
                               (if ctx
-                                  (curry every ctx)
-                                  every)
+                                  (curry each ctx)
+                                  each)
                               si)
       #f)
-	(if post (post) #f)
+	(if post (post ctx) #f)
 	#t))
 
 ;; return the entity ids of the entities in system s
@@ -400,15 +431,16 @@
 		  (i 0))
 	  (if (fx= i n)
 		  total
-		  (loop (+ total (system-count-entities i))
+		  (loop (+ total (system-count-entities wrld i))
 				(+ i 1))))))
 
 ;; This removes all entities from all systems.  Assuming that entities
 ;; are not captured by other contexts, this results in the garbage
 ;; collection of all entities.
 (define (reset-all-systems! wrld)
+  (set-world-entities! wrld (default-entities))
   (let ((n (vector-length (world-systems wrld))))
-	(let outer-loop ((count (total-entity-count)))
+	(let outer-loop ((count (total-entity-count wrld)))
 	  (cond
 	   ((fx= count 0)
 		#t)
@@ -419,10 +451,10 @@
 			#t)
 		   (else
 			;; Save the trouble of all the backtracking logic implied in deleting during traversal.
-			(let ((entities (system-map-entities (lambda (e . ignore) e) i)))
-			  (map delete! entities)
+			(let ((entities (system-map-entities wrld (lambda (e . ignore) e) i)))
+			  (map (curry delete! wrld) entities)
 			  (loop (fx+ i 1))))))
-		(outer-loop (total-entity-count)))))))
+		(outer-loop (total-entity-count wrld)))))))
 
 ;; ************************************************
 ;;
@@ -661,6 +693,6 @@
 	(if (not (not exit))
 		(call-with-system-components exit e si)
 		#f)
-	(system-remove si e)))
+	(system-remove wrld si e)))
 
 (provide (all-defined-out))
